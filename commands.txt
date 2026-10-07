@@ -1,0 +1,7 @@
+All required commands in NetWatch:
+
+go build -o netwatch . && sudo ./netwatch
+sudo go run . 
+
+arp -a
+arp - an
