@@ -1,0 +1,7 @@
+All required concepts to understand this project:
+
+Networking:
+
+en0:
+- en0 is the primary network interface name on macOS, representing hardware connection—most commonly the built in Wi-Fi card on MacBooks
+

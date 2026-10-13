@@ -1,6 +1,8 @@
 All required commands in NetWatch:
 
 go build -o netwatch . && sudo ./netwatch
+(Compiles the all the .go code files into a single executable called "netwatch" )
+
 sudo go run . 
 
 arp -a
