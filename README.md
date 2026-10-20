@@ -8,7 +8,7 @@ Home network monitor in Go: discovers devices on your LAN with ARP scanning. Bui
 
 - **ARP scan** of your local network using [gopacket](https://github.com/google/gopacket) (raw ARP requests, not the OS ARP cache).
 - **Scan range from the netmask**: reads the interface's real subnet (e.g. `/24`, `/19`) instead of assuming a `/24`. Capped at `/19` (8,190 hosts) so a huge network doesn't flood the wifi.
-- **Vendor lookup** from the MAC address using the IEEE OUI list (e.g. `f4:ca:e7` -> Arcadyan).
+- **Vendor lookup** from the MAC address using the IEEE OUI list (the first 3 bytes of a MAC identify the manufacturer).
 - **Randomized MAC detection**: modern phones use private per-network MACs; these are labelled instead of shown as "unknown".
 - **PostgreSQL storage**: known devices (upserted by MAC), a row per scan, and a per-scan sightings history.
 
@@ -20,10 +20,10 @@ scanning 254 addresses
 
 NAME                              IP               MAC
 --------------------------------------------------------------------
-Arcadyan Corporation              192.168.29.1     f4:ca:e7:cd:8c:fa
-Earda Technologies co Ltd         192.168.29.80    48:7e:48:c1:3f:ef
-Chinmays-Laptop.local (this Mac)  192.168.29.175   7e:ea:f7:60:5d:84
-randomized (private MAC)          192.168.29.229   8e:36:e7:1f:e1:4a
+Example Router Corp               192.168.1.1      aa:bb:cc:00:00:01
+Example IoT Vendor Ltd            192.168.1.20     aa:bb:dd:00:00:02
+My-Laptop.local (this Mac)        192.168.1.35     02:00:00:00:00:03
+randomized (private MAC)          192.168.1.42     da:00:00:00:00:04
 
 devices found: 4
 ```
