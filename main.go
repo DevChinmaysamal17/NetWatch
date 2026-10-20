@@ -42,15 +42,15 @@ func main() {
 	}
 
 	// 1. Find our network card (en0 = Wi-Fi on a Mac) and open it (needs sudo).
-	iface, myIP := getInterface("en0") // scan.go
-	handle := openHandle("en0")        // scan.go
+	iface, myIP, network := getInterface("en0") // scan.go
+	handle := openHandle("en0")                 // scan.go
 	defer handle.Close()
 
 	// 2. Listen for ARP replies in the background.
 	go listenForReplies(handle) // scan.go
 
 	// 3. Ask every address on the network "who are you?" (blocks until done).
-	scanNetwork(handle, iface, myIP) // scan.go
+	scanNetwork(handle, iface, myIP, network) // scan.go
 
 	// 4. Our own Mac never replies to itself, so add it by hand.
 	addSelf(iface, myIP) // scan.go

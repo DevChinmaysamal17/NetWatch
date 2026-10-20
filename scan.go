@@ -12,6 +12,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -27,25 +28,44 @@ import (
 // the card itself plus our own IPv4 address on it.
 // We need our IP to know which subnet to scan (192.168.29.x) and to fill in
 // the "who is asking" part of every ARP question.
-func getInterface(name string) (*net.Interface, net.IP) {
+func getInterface(name string) (*net.Interface, net.IP, *net.IPNet) {
 	iface, err := net.InterfaceByName(name)
 	if err != nil {
 		fmt.Println("interface error:", err)
-		os.Exit(1) // can't continue without a network card
+		os.Exit(1)
 	}
-
-	// A card can have several addresses (IPv4, IPv6...). Loop through them.
 	addrs, _ := iface.Addrs()
 	for _, a := range addrs {
-		// Keep only IPv4 addresses. To4() returns nil for IPv6.
 		if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
-			return iface, ipn.IP.To4()
+			return iface, ipn.IP.To4(), ipn
 		}
 	}
-
 	fmt.Println("no IPv4 address found on", name)
 	os.Exit(1)
-	return nil, nil // never reached, Go just wants a return at the end
+	return nil, nil, nil
+}
+
+// hostsIn returns every usable address in the network, capped at /20
+// (8192 addresses) so a huge network doesn't flood the wifi.
+func hostsIn(myIP net.IP, n *net.IPNet) []net.IP {
+	ones, _ := n.Mask.Size()
+	if ones < 19 {
+		ones = 19
+	}
+	if ones >= 31 {
+		return nil // /31 and /32 have no normal hosts
+	}
+	mask := net.CIDRMask(ones, 32)
+	base := binary.BigEndian.Uint32(myIP.Mask(mask))
+	size := uint32(1) << (32 - ones)
+
+	var hosts []net.IP
+	for i := uint32(1); i < size-1; i++ { // skip network (0) and broadcast (last)
+		ip := make(net.IP, 4)
+		binary.BigEndian.PutUint32(ip, base+i)
+		hosts = append(hosts, ip)
+	}
+	return hosts
 }
 
 // openHandle opens the network card in "raw" mode so we can send and read
@@ -103,20 +123,19 @@ func listenForReplies(handle *pcap.Handle) {
 // scanNetwork asks every address on our /24 network (x.x.x.1 to x.x.x.254)
 // "who has this IP?". Real devices answer, and listenForReplies catches
 // those answers.
-func scanNetwork(handle *pcap.Handle, iface *net.Interface, myIP net.IP) {
-	// Two rounds, because a sleeping phone often misses the first question.
+func scanNetwork(handle *pcap.Handle, iface *net.Interface, myIP net.IP, n *net.IPNet) {
+	ones, _ := n.Mask.Size()
+	fmt.Println("real mask: /", ones)
+	hosts := hostsIn(myIP, n)
+	fmt.Println("scanning", len(hosts), "addresses")
+
 	for round := 0; round < 2; round++ {
-		for i := 1; i <= 254; i++ {
-			// Build the target by keeping our first 3 numbers and swapping
-			// the last one. Example: 192.168.29.175 -> 192.168.29.<i>
-			target := net.IPv4(myIP[0], myIP[1], myIP[2], byte(i)).To4()
-
+		for _, target := range hosts {
 			sendRequest(handle, iface, myIP, target)
+			time.Sleep(200 * time.Microsecond) // 5000 packets per second
 		}
-		time.Sleep(1 * time.Second) // pause before the next round
+		time.Sleep(1 * time.Second)
 	}
-
-	// Give slow devices time to answer before we move on.
 	time.Sleep(2 * time.Second)
 }
 

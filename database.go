@@ -1,7 +1,7 @@
 // Tables used:
 
-// devices   -> one row per unique MAC (current state, first/last seen)
-// scans     -> one row per run of the program
+// devices -> one row per unique MAC (current state, first/last seen)
+// scans -> one row per run of the program
 // sightings -> one row per (scan, device): "device X was seen in scan Y"
 package main
 
