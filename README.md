@@ -93,4 +93,4 @@ Only run NetWatch on networks you own or have permission to scan.
 
 ## License
 
-Not yet chosen.
+MIT License
