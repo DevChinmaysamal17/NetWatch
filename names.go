@@ -1,5 +1,3 @@
-// names.go
-//
 // Picks a display name for a device: its manufacturer, looked up from the
 // MAC address (see oui.go). Hostname discovery (mDNS) was removed.
 package main

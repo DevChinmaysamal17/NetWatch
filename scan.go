@@ -1,14 +1,3 @@
-// scan.go
-//
-// Device discovery using ARP (Address Resolution Protocol).
-//
-// ARP in one sentence: a device asks the whole network "Who has IP x.x.x.x?
-// Tell me your MAC address", and the owner of that IP answers.
-// (OSI layer 2/3: it translates a layer-3 IP into a layer-2 MAC.)
-//
-// Flow: open the card -> listen for replies in the background ->
-//
-//	send a question for every address 1..254 -> collect the answers.
 package main
 
 import (
@@ -16,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/gopacket"
@@ -23,11 +13,8 @@ import (
 	"github.com/google/gopacket/pcap"
 )
 
-// getInterface finds the network card by name (e.g. "en0") and returns
-// en0 name macOS gives the to network interface
-// the card itself plus our own IPv4 address on it.
-// We need our IP to know which subnet to scan (192.168.29.x) and to fill in
-// the "who is asking" part of every ARP question.
+var lastReply atomic.Int64
+
 func getInterface(name string) (*net.Interface, net.IP, *net.IPNet) {
 	iface, err := net.InterfaceByName(name)
 	if err != nil {
@@ -45,22 +32,21 @@ func getInterface(name string) (*net.Interface, net.IP, *net.IPNet) {
 	return nil, nil, nil
 }
 
-// hostsIn returns every usable address in the network, capped at /20
-// (8192 addresses) so a huge network doesn't flood the wifi.
+// hostsIn scans at most a /19 network and skips network and broadcast addresses.
 func hostsIn(myIP net.IP, n *net.IPNet) []net.IP {
 	ones, _ := n.Mask.Size()
 	if ones < 19 {
 		ones = 19
 	}
 	if ones >= 31 {
-		return nil // /31 and /32 have no normal hosts
+		return nil
 	}
 	mask := net.CIDRMask(ones, 32)
 	base := binary.BigEndian.Uint32(myIP.Mask(mask))
 	size := uint32(1) << (32 - ones)
 
 	var hosts []net.IP
-	for i := uint32(1); i < size-1; i++ { // skip network (0) and broadcast (last)
+	for i := uint32(1); i < size-1; i++ {
 		ip := make(net.IP, 4)
 		binary.BigEndian.PutUint32(ip, base+i)
 		hosts = append(hosts, ip)
@@ -68,15 +54,13 @@ func hostsIn(myIP net.IP, n *net.IPNet) []net.IP {
 	return hosts
 }
 
-// openHandle opens the network card in "raw" mode so we can send and read
-// packets directly. This is the part that needs sudo: raw access is
-// restricted to root because it can see all traffic on the card.
+// openHandle may require elevated privileges to capture and send packets.
 func openHandle(name string) *pcap.Handle {
 	handle, err := pcap.OpenLive(
 		name,
-		65536,             // max bytes to capture per packet (more than enough)
-		true,              // promiscuous mode: also see packets not meant for us
-		pcap.BlockForever, // wait for packets with no timeout
+		65536,
+		true,
+		pcap.BlockForever,
 	)
 	if err != nil {
 		fmt.Println("pcap error (try sudo):", err)
@@ -85,44 +69,28 @@ func openHandle(name string) *pcap.Handle {
 	return handle
 }
 
-// listenForReplies runs in the BACKGROUND (started with `go` in main).
-// It watches every packet that arrives, keeps only ARP replies, and saves
-// the sender's IP and MAC into the `devices` map.
 func listenForReplies(handle *pcap.Handle) {
-	// A "packet source" turns the raw bytes from the card into packets
-	// we can inspect layer by layer.
 	src := gopacket.NewPacketSource(handle, handle.LinkType())
 
-	// This loop runs for as long as the program is alive.
 	for pkt := range src.Packets() {
-		// Does this packet contain an ARP layer? If not, ignore it.
 		layer := pkt.Layer(layers.LayerTypeARP)
 		if layer == nil {
 			continue
 		}
 		arp := layer.(*layers.ARP)
-
-		// ARP packets are either questions (Request) or answers (Reply).
-		// We only keep answers here.
 		if arp.Operation != layers.ARPReply {
 			continue
 		}
 
-		// In a reply, the "source" fields describe the device that answered:
-		// its IP and its MAC. Convert the raw bytes to readable strings.
 		ip := net.IP(arp.SourceProtAddress).String()
 		mac := net.HardwareAddr(arp.SourceHwAddress).String()
 
-		// Save it. Lock first, because main may be reading the map too.
 		mu.Lock()
 		devices[ip] = mac
 		mu.Unlock()
 	}
 }
 
-// scanNetwork asks every address on our /24 network (x.x.x.1 to x.x.x.254)
-// "who has this IP?". Real devices answer, and listenForReplies catches
-// those answers.
 func scanNetwork(handle *pcap.Handle, iface *net.Interface, myIP net.IP, n *net.IPNet) {
 	ones, _ := n.Mask.Size()
 	fmt.Println("real mask: /", ones)
@@ -130,65 +98,61 @@ func scanNetwork(handle *pcap.Handle, iface *net.Interface, myIP net.IP, n *net.
 	fmt.Println("scanning", len(hosts), "addresses")
 
 	for round := 0; round < 2; round++ {
-		for _, target := range hosts {
+		for i, target := range hosts {
 			sendRequest(handle, iface, myIP, target)
-			time.Sleep(200 * time.Microsecond) // 5000 packets per second
+			if i%16 == 15 {
+				time.Sleep(time.Millisecond) // pace in bursts; per-packet 200µs sleeps are unreliable
+			}
 		}
-		time.Sleep(1 * time.Second)
+		time.Sleep(150 * time.Millisecond) // let round 1 replies land before round 2
 	}
-	time.Sleep(2 * time.Second)
+	waitQuiet(300*time.Millisecond, 1500*time.Millisecond)
 }
 
-// sendRequest builds and sends ONE ARP question: "Who has <target>?".
-//
-// A packet is built in layers, like envelopes:
-//
-//	Ethernet (outer envelope: who it's from / to, on the local network)
-//	  -> ARP (the actual question inside)
-//
-// This code is boilerplate: it is the same every time, so treat it as a
-// black box that means "ask the network who owns `target`".
+// waitQuiet returns once no reply has arrived for `quiet`, or after `max`.
+func waitQuiet(quiet, max time.Duration) {
+	start := time.Now()
+	for {
+		time.Sleep(50 * time.Millisecond)
+		last := time.Unix(0, lastReply.Load())
+		if last.Before(start) {
+			last = start
+		}
+		if time.Since(last) >= quiet || time.Since(start) >= max {
+			return
+		}
+	}
+}
+
 func sendRequest(handle *pcap.Handle, iface *net.Interface, myIP net.IP, target net.IP) {
-	// Outer layer (OSI layer 2): the Ethernet frame.
 	eth := layers.Ethernet{
-		SrcMAC: iface.HardwareAddr, // from: our MAC
-		// To: ff:ff:ff:ff:ff:ff is the BROADCAST address = "everyone on the
-		// network". We don't know who owns the IP, so we ask all devices.
+		SrcMAC:       iface.HardwareAddr,
 		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
-		EthernetType: layers.EthernetTypeARP, // the payload inside is ARP
+		EthernetType: layers.EthernetTypeARP,
 	}
 
-	// Inner layer: the ARP question itself.
 	arp := layers.ARP{
-		AddrType:        layers.LinkTypeEthernet, // we're on Ethernet/Wi-Fi
-		Protocol:        layers.EthernetTypeIPv4, // the addresses are IPv4
-		HwAddressSize:   6,                       // a MAC is 6 bytes
-		ProtAddressSize: 4,                       // an IPv4 address is 4 bytes
-		Operation:       layers.ARPRequest,       // this is a question
+		AddrType:        layers.LinkTypeEthernet,
+		Protocol:        layers.EthernetTypeIPv4,
+		HwAddressSize:   6,
+		ProtAddressSize: 4,
+		Operation:       layers.ARPRequest,
 
-		SourceHwAddress:   []byte(iface.HardwareAddr), // asker's MAC (us)
-		SourceProtAddress: []byte(myIP),               // asker's IP (us)
-
-		// The MAC we're looking for is unknown, that's the whole question,
-		// so it's left as all zeros.
-		DstHwAddress: []byte{0, 0, 0, 0, 0, 0},
-
-		DstProtAddress: []byte(target), // "who has THIS IP?"
+		SourceHwAddress:   []byte(iface.HardwareAddr),
+		SourceProtAddress: []byte(myIP),
+		DstHwAddress:      []byte{0, 0, 0, 0, 0, 0},
+		DstProtAddress:    []byte(target),
 	}
 
-	// Turn the two layers into raw bytes and send them out of the card.
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{
-		FixLengths:       true, // fill in length fields automatically
-		ComputeChecksums: true, // fill in checksums automatically
+		FixLengths:       true,
+		ComputeChecksums: true,
 	}
 	gopacket.SerializeLayers(buf, opts, &eth, &arp)
 	handle.WritePacketData(buf.Bytes())
 }
 
-// addSelf adds our own Mac to the device list by hand.
-// A computer never answers its own ARP question, so without this our Mac
-// would be missing from the table.
 func addSelf(iface *net.Interface, myIP net.IP) {
 	mu.Lock()
 	devices[myIP.String()] = iface.HardwareAddr.String()

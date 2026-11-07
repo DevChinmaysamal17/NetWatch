@@ -1,8 +1,3 @@
-// Tables used:
-
-// devices -> one row per unique MAC (current state, first/last seen)
-// scans -> one row per run of the program
-// sightings -> one row per (scan, device): "device X was seen in scan Y"
 package main
 
 import (
@@ -11,9 +6,67 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// connectDB opens ONE connection to the local netwatchdb database.
+// Both *pgx.Conn and pgx.Tx satisfy this.
+type DBTX interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+type DeviceState struct {
+	ID           int
+	IP           string
+	IsOnline     bool
+	MissedScans  int
+	IsRandomized bool
+}
+
+// Keyed by lowercase MAC ("aa:bb:cc:dd:ee:ff").
+func loadDeviceStates(db DBTX) (map[string]DeviceState, error) {
+	rows, err := db.Query(context.Background(), `
+		SELECT id, mac_address::text, COALESCE(host(ip_address), ''),
+		       is_online, missed_scans, is_randomized
+		FROM devices`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	states := make(map[string]DeviceState)
+	for rows.Next() {
+		var mac string
+		var s DeviceState
+		if err := rows.Scan(&s.ID, &mac, &s.IP, &s.IsOnline, &s.MissedScans, &s.IsRandomized); err != nil {
+			return nil, err
+		}
+		states[mac] = s
+	}
+	return states, rows.Err()
+}
+
+func insertEvent(db DBTX, scanID, deviceID int, eventType, oldIP, newIP string) error {
+	_, err := db.Exec(context.Background(), `
+		INSERT INTO device_events (device_id, scan_id, event_type, old_ip, new_ip)
+		VALUES ($1, $2, $3, NULLIF($4::text,'')::inet, NULLIF($5::text,'')::inet)`,
+		deviceID, scanID, eventType, oldIP, newIP)
+	return err
+}
+
+// Bumps the miss counter for every device not seen this scan, and flips
+// is_online to false once it hits the threshold.
+func recordMisses(db DBTX, seenIDs []int, threshold int) error {
+	_, err := db.Exec(context.Background(), `
+		UPDATE devices
+		SET missed_scans = missed_scans + 1,
+		    is_online    = CASE WHEN missed_scans + 1 >= $2 THEN false ELSE is_online END
+		WHERE NOT (id = ANY($1))`,
+		seenIDs, threshold)
+	return err
+}
+
 // A single pgx.Conn is not safe to share between goroutines, which is fine
 // because all DB writes happen in main's goroutine, after scanning.
 func connectDB() (*pgx.Conn, error) {
@@ -29,9 +82,6 @@ func connectDB() (*pgx.Conn, error) {
 }
 
 // isRandomizedMAC reports whether a MAC is a "private"/randomized one.
-// Phones rotate these on public WiFi, so one phone can look like several
-// devices. The rule: if the 2nd hex character of the first byte is
-// 2, 6, a or e, the "locally administered" bit is set (e.g. 1a:9e:..).
 func isRandomizedMAC(mac string) bool {
 	if len(mac) < 2 {
 		return false
@@ -41,7 +91,7 @@ func isRandomizedMAC(mac string) bool {
 
 // startScan inserts a new row into `scans` and returns its id.
 // started_at fills itself in (DEFAULT now()), so we insert no columns.
-func startScan(conn *pgx.Conn) (int, error) {
+func startScan(conn DBTX) (int, error) {
 	var scanID int
 	err := conn.QueryRow(
 		context.Background(),
@@ -52,14 +102,7 @@ func startScan(conn *pgx.Conn) (int, error) {
 
 // saveDevice inserts a device, or updates it if its MAC is already known
 // (an "upsert"). It returns the device's id so a sighting can point to it.
-//
-//   - ON CONFLICT (mac_address): the MAC is the unique key, so a repeat
-//     sighting updates the existing row instead of creating a duplicate.
-//   - hostname: NULLIF turns "unknown" into NULL, then COALESCE keeps the
-//     OLD hostname, so a scan that fails to resolve a name never overwrites
-//     a good one with "unknown".
-//   - RETURNING id: gives us the row's id for both new and updated rows.
-func saveDevice(conn *pgx.Conn, mac, ip, hostname string) (int, error) {
+func saveDevice(conn DBTX, mac, ip, hostname string) (int, error) {
 	var deviceID int
 	err := conn.QueryRow(
 		context.Background(),
@@ -71,6 +114,8 @@ func saveDevice(conn *pgx.Conn, mac, ip, hostname string) (int, error) {
 			ip_address    = EXCLUDED.ip_address,
 			hostname      = COALESCE(NULLIF(EXCLUDED.hostname, 'unknown'), devices.hostname),
 			is_randomized = EXCLUDED.is_randomized,
+			is_online     = true,
+			missed_scans  = 0,
 			last_seen     = CURRENT_TIMESTAMP
 		RETURNING id
 		`,
@@ -80,9 +125,7 @@ func saveDevice(conn *pgx.Conn, mac, ip, hostname string) (int, error) {
 }
 
 // saveSighting records that a device was seen in a given scan, at a given IP.
-// The primary key is (scan_id, device_id), so ON CONFLICT DO NOTHING makes
-// saving the same device twice in one scan harmless.
-func saveSighting(conn *pgx.Conn, scanID, deviceID int, ip string) error {
+func saveSighting(conn DBTX, scanID, deviceID int, ip string) error {
 	_, err := conn.Exec(
 		context.Background(),
 		`
@@ -97,7 +140,7 @@ func saveSighting(conn *pgx.Conn, scanID, deviceID int, ip string) error {
 
 // finishScan stamps the scan row with its end time and how many devices
 // were saved, so "how big was scan #N" is a simple lookup later.
-func finishScan(conn *pgx.Conn, scanID, hostCount int) error {
+func finishScan(conn DBTX, scanID, hostCount int) error {
 	_, err := conn.Exec(
 		context.Background(),
 		`UPDATE scans SET finished_at = now(), host_count = $2 WHERE id = $1`,

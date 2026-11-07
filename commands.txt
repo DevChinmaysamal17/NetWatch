@@ -3,7 +3,10 @@ All required commands in NetWatch:
 go build -o netwatch . && sudo ./netwatch
 (Compiles the all the .go code files into a single executable called "netwatch" )
 
-sudo go run . 
+make run // to run the project
+muke build // to make a executable files
+
+
 
 arp -a
 arp - an
