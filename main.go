@@ -9,7 +9,7 @@ import (
 )
 
 var (
-	// devices maps IP -> MAC for every device that answered our ARP scan.
+	// devices maps ip -> mac for every device that answered our ARP scan.
 	devices = map[string]string{}
 
 	// mu protects the map above.

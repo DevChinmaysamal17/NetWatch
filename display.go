@@ -1,6 +1,6 @@
 // display.go
 //
-// Prints the final results as a table: NAME, IP, MAC.
+// Prints the final results as a table: name, IP, MAC.
 package main
 
 import (
@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-// printTable sorts the devices by IP and prints one row per device.
+// printTable sorts the devices by ip and prints one row per device.
 func printTable(myIP net.IP) {
 	// Copy the IPs out of the map into a slice, so we can sort them.
 	// (Maps have no order in Go.) Lock while reading the map.
